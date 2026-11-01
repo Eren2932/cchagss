@@ -214,6 +214,20 @@ jobs:
           APP_VERSION: ${{ steps.src.outputs.version_numeric }}
         run: gradle createReleaseDistributable --no-daemon
 
+      # 6b. Если jpackage упал — печатаем его логи (в логе Gradle причины не видно)
+      - name: Dump jpackage logs on failure
+        if: failure()
+        shell: pwsh
+        working-directory: ${{ steps.src.outputs.proj }}
+        run: |
+          $dir = Join-Path (Get-Location) 'build/compose'
+          if (Test-Path $dir) {
+            Get-ChildItem $dir -Recurse -File -Include *.txt | ForEach-Object {
+              Write-Host "=================== $($_.FullName)"
+              Get-Content $_.FullName -Raw
+            }
+          } else { Write-Host "no $dir" }
+
       # 7. Официальный adb.exe
       - name: Fetch Android platform-tools
         shell: pwsh
