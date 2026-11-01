@@ -156,7 +156,7 @@ jobs:
             Write-Host "ZIP не найдено, но проект лежит в корне репо. Собираем его."
             $proj = '.'
             $txt = Get-Content 'build.gradle.kts' -Raw
-            $m = [regex]::Match($txt, 'gradleProperty\("appVersion"\)\.getOrElse\("([^"]+)"\)')
+            $m = [regex]::Match($txt, 'defaultAppVersion\s*=\s*"([^"]+)"')
             if (-not $m.Success) { $m = [regex]::Match($txt, 'version\s*=\s*"([^"]+)"') }
             if (-not $m.Success) { Write-Error 'Не нашёл версию в build.gradle.kts' }
             $ver = $m.Groups[1].Value
@@ -203,12 +203,16 @@ jobs:
       # 5. Тесты: сломанная SafetyPolicy не должна уехать в релиз
       - name: Run tests
         working-directory: ${{ steps.src.outputs.proj }}
-        run: gradle test --no-daemon -PappVersion=${{ steps.src.outputs.version_numeric }}
+        env:
+          APP_VERSION: ${{ steps.src.outputs.version_numeric }}
+        run: gradle test --no-daemon
 
       # 6. Portable app-image (exe + урезанный runtime)
       - name: Build release distributable
         working-directory: ${{ steps.src.outputs.proj }}
-        run: gradle createReleaseDistributable --no-daemon -PappVersion=${{ steps.src.outputs.version_numeric }}
+        env:
+          APP_VERSION: ${{ steps.src.outputs.version_numeric }}
+        run: gradle createReleaseDistributable --no-daemon
 
       # 7. Официальный adb.exe
       - name: Fetch Android platform-tools
