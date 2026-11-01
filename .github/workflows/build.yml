@@ -1,166 +1,315 @@
 name: Build & Release ChanganModRU
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Триггеры:
-#   1. Пуш тега вида v2.1.0  → релизная сборка + GitHub Release с ZIP.
-#   2. Ручной запуск (Actions → Run workflow) → сборка + артефакт (без Release).
+# КАК ПОЛЬЗОВАТЬСЯ (без распаковки):
+#   1. Положи этот файл в репо ОДИН РАЗ по пути  .github/workflows/build.yml
+#      (GitHub читает workflow только оттуда, из ZIP он не подхватится).
+#   2. Дальше просто заливаешь в репо новый ZIP проекта, например
+#         ChanganModRU-v2.1.1-src.zip
+#      и делаешь commit/push. Сборка стартует сама.
 #
-# Логика версии (приоритет сверху вниз):
-#   git-тег  >  ручной ввод  >  дефолт из build.gradle.kts
-# Версия протягивается в Gradle (-PappVersion) и дальше в: exe, имя папки,
-# имя ZIP, VERSION.txt, build-manifest.json, имя Release. Поэтому каждый ZIP
-# однозначно знает, к какой версии и коммиту он относится.
+# ЧТО ДЕЛАЕТ:
+#   - Находит в репо все *.zip с версией X.Y.Z в имени, берёт С НАИБОЛЬШЕЙ версией.
+#   - Распаковывает его сам, находит build.gradle.kts (даже если внутри есть
+#     корневая папка), собирает Compose Desktop → portable-папка.
+#   - Докладывает adb.exe, папки Apk/ tinove/ Scripts/ (с тем, что лежало в ZIP).
+#   - Пакует ChanganModRU-vX.Y.Z-portable-win64.zip и публикует GitHub Release
+#     с тегом vX.Y.Z. Версия из имени ZIP попадает в exe, манифест, имя релиза.
+#   - Если ZIP нет вообще, а проект лежит в репо распакованным (build.gradle.kts
+#     в корне), собирает его.
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
   push:
-    tags:
-      - 'v*'
+    paths:
+      - '**.zip'
+      - '.github/workflows/build.yml'
   workflow_dispatch:
     inputs:
-      version:
-        description: 'Версия вручную (напр. 2.1.0). Пусто = дефолт из build.gradle.kts'
+      zip:
+        description: 'Путь к ZIP в репо (пусто = взять самый свежий по версии)'
         required: false
         default: ''
+      version:
+        description: 'Переопределить версию (пусто = из имени ZIP)'
+        required: false
+        default: ''
+      publish:
+        description: 'Опубликовать GitHub Release'
+        type: boolean
+        required: false
+        default: true
 
 permissions:
-  contents: write   # создание Release и загрузка файлов
+  contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: true
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   APP_NAME: ChanganModRU
-  PAYLOAD_DIRS: 'Apk tinove Scripts'
   PLATFORM_TOOLS_URL: 'https://dl.google.com/android/repository/platform-tools-latest-windows.zip'
 
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 45
 
     steps:
-      # 1. Код
+      # 1. Код репозитория
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2. JDK 17 (toolchain проекта)
+      # 2. Ищем самый свежий ZIP, распаковываем, определяем версию
+      - name: Locate and unpack project
+        id: src
+        shell: pwsh
+        env:
+          MANUAL_ZIP: ${{ github.event.inputs.zip }}
+          MANUAL_VER: ${{ github.event.inputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = (Get-Location).Path
+
+          function Set-Out([string]$k, [string]$v) {
+            "$k=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
+          function Parse-Ver([string]$name) {
+            $m = [regex]::Match($name, '(\d+\.\d+\.\d+)(?:-((?:alpha|beta|rc)[0-9.]*))?')
+            if (-not $m.Success) { return $null }
+            [pscustomobject]@{ Ver = [version]$m.Groups[1].Value; Pre = $m.Groups[2].Value }
+          }
+
+          # --- кандидаты ---
+          $zips = @(Get-ChildItem -Recurse -File -Filter '*.zip' | ForEach-Object {
+            $rel = [IO.Path]::GetRelativePath($root, $_.FullName)
+            if ($rel -match '^(\.git|_src|dist|\.pt|node_modules)[\\/]') { return }
+            if ($rel -match '[\\/]build[\\/]') { return }
+            if ($_.Name -match 'portable|win64') { return }
+            $p = Parse-Ver $_.Name
+            if ($null -eq $p) { Write-Host "  пропуск (нет версии в имени): $rel"; return }
+            [pscustomobject]@{
+              Rel = $rel; Full = $_.FullName; Name = $_.Name
+              Ver = $p.Ver; Pre = $p.Pre; SizeMB = [math]::Round($_.Length / 1MB, 2)
+            }
+          })
+
+          Write-Host "Найдено ZIP с версией: $($zips.Count)"
+          if ($zips.Count -gt 0) {
+            $zips | Sort-Object Ver -Descending | Format-Table Rel, Ver, Pre, SizeMB -AutoSize | Out-String | Write-Host
+          }
+
+          # --- выбор ---
+          $best = $null
+          if (-not [string]::IsNullOrWhiteSpace($env:MANUAL_ZIP)) {
+            $f = Get-Item -LiteralPath $env:MANUAL_ZIP.Trim() -ErrorAction Stop
+            $p = Parse-Ver $f.Name
+            if ($null -eq $p) { $p = [pscustomobject]@{ Ver = [version]'0.0.0'; Pre = '' } }
+            $best = [pscustomobject]@{
+              Rel = [IO.Path]::GetRelativePath($root, $f.FullName); Full = $f.FullName
+              Name = $f.Name; Ver = $p.Ver; Pre = $p.Pre
+            }
+          } elseif ($zips.Count -gt 0) {
+            # больше версия → выше; при равенстве релиз важнее pre-release; затем имя
+            $sorted = $zips | Sort-Object -Property `
+              @{ Expression = 'Ver'; Descending = $true }, `
+              @{ Expression = { [string]::IsNullOrEmpty($_.Pre) }; Descending = $true }, `
+              @{ Expression = 'Name'; Descending = $true }
+
+            # берём первый, внутри которого реально лежит проект (есть build.gradle.kts)
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            foreach ($c in $sorted) {
+              $za = [IO.Compression.ZipFile]::OpenRead($c.Full)
+              try {
+                $isProject = $null -ne ($za.Entries | Where-Object { $_.FullName -match '(^|[\\/])build\.gradle\.kts$' } | Select-Object -First 1)
+              } finally { $za.Dispose() }
+              if ($isProject) { $best = $c; break }
+              Write-Host "  пропуск (внутри нет build.gradle.kts): $($c.Rel)"
+            }
+          }
+
+          if ($null -ne $best) {
+            $mode = 'zip'
+            Write-Host "Берём ZIP: $($best.Rel)"
+            if (Test-Path '_src') { Remove-Item '_src' -Recurse -Force }
+            Expand-Archive -LiteralPath $best.Full -DestinationPath '_src' -Force
+
+            # ищем build.gradle.kts: самый мелкий по вложенности, мусор не берём
+            $srcAbs = (Resolve-Path '_src').Path
+            $g = Get-ChildItem '_src' -Recurse -File -Filter 'build.gradle.kts' | Where-Object {
+              $r = [IO.Path]::GetRelativePath($srcAbs, $_.FullName)
+              $r -notmatch '(^|[\\/])(build|\.gradle|__MACOSX)[\\/]'
+            } | Sort-Object { ($_.FullName -split '[\\/]').Count } | Select-Object -First 1
+
+            if ($null -eq $g) {
+              Write-Error "В архиве '$($best.Rel)' нет build.gradle.kts. Это точно ZIP проекта (ChanganModRU-vX.Y.Z-src.zip)?"
+            }
+            $proj = [IO.Path]::GetRelativePath($root, $g.DirectoryName)
+            $ver = $best.Ver.ToString()
+            if ($best.Pre) { $ver = "$ver-$($best.Pre)" }
+            $verSrc = "имя ZIP ($($best.Name))"
+            $zipName = $best.Name
+          }
+          elseif (Test-Path 'build.gradle.kts') {
+            $mode = 'repo-root'
+            Write-Host "ZIP не найдено, но проект лежит в корне репо. Собираем его."
+            $proj = '.'
+            $txt = Get-Content 'build.gradle.kts' -Raw
+            $m = [regex]::Match($txt, 'gradleProperty\("appVersion"\)\.getOrElse\("([^"]+)"\)')
+            if (-not $m.Success) { $m = [regex]::Match($txt, 'version\s*=\s*"([^"]+)"') }
+            if (-not $m.Success) { Write-Error 'Не нашёл версию в build.gradle.kts' }
+            $ver = $m.Groups[1].Value
+            $verSrc = 'build.gradle.kts'
+            $zipName = '(нет)'
+          }
+          else {
+            Write-Error "Не нашёл ни ZIP проекта (имя вида ChanganModRU-v2.1.1-src.zip), ни build.gradle.kts в корне репо."
+          }
+
+          if (-not [string]::IsNullOrWhiteSpace($env:MANUAL_VER)) {
+            $ver = $env:MANUAL_VER.Trim().TrimStart('v')
+            $verSrc = 'ручной ввод'
+          }
+
+          $num = ($ver -replace '[-+].*$', '')
+          if ($num -notmatch '^\d+\.\d+\.\d+$') {
+            Write-Error "Версия '$ver' должна быть вида X.Y.Z или X.Y.Z-beta"
+          }
+
+          Write-Host "Проект: $proj | версия: $ver (числовая $num) | источник: $verSrc | режим: $mode"
+          Set-Out 'mode' $mode
+          Set-Out 'proj' $proj
+          Set-Out 'version' $ver
+          Set-Out 'version_numeric' $num
+          Set-Out 'version_src' $verSrc
+          Set-Out 'source_zip' $zipName
+          Set-Out 'prerelease' ([string]($ver -match '-'))
+          Set-Out 'sha_short' $env:GITHUB_SHA.Substring(0, 7)
+
+      # 3. JDK 17 (toolchain проекта)
       - name: Setup JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      # 3. Gradle (в репо нет wrapper-jar, поэтому ставим версию явно)
+      # 4. Gradle (wrapper-jar в проекте нет, ставим версию явно)
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.10.2'
 
-      # 4. Версия: тег > ручной ввод > дефолт из build.gradle.kts
-      - name: Resolve version
-        id: ver
-        shell: pwsh
-        run: |
-          $ref   = "${{ github.ref }}"
-          $input = "${{ github.event.inputs.version }}"
-          if ($ref -like 'refs/tags/v*') {
-            $v = $ref -replace '^refs/tags/v', ''
-            $src = 'git-tag'
-          } elseif (-not [string]::IsNullOrWhiteSpace($input)) {
-            $v = $input.Trim().TrimStart('v')
-            $src = 'manual-input'
-          } else {
-            $gradle = Get-Content 'build.gradle.kts' -Raw
-            $m = [regex]::Match($gradle, 'gradleProperty\("appVersion"\)\.getOrElse\("([^"]+)"\)')
-            if (-not $m.Success) { Write-Error 'Не нашёл дефолтную версию в build.gradle.kts'; exit 1 }
-            $v = $m.Groups[1].Value
-            $src = 'build.gradle.kts'
-          }
-          # Для exe нужна строго числовая версия X.Y.Z (суффикс -beta допустим только в имени)
-          $num = ($v -replace '[-+].*$', '')
-          if ($num -notmatch '^\d+\.\d+\.\d+$') {
-            Write-Error "Версия '$v' должна быть вида X.Y.Z или X.Y.Z-suffix"
-            exit 1
-          }
-          Write-Host "Версия: $v (числовая: $num, источник: $src)"
-          "version=$v"           | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "version_numeric=$num" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "source=$src"          | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "sha_short=$($env:GITHUB_SHA.Substring(0,7))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-
-      # 5. Тесты (SafetyPolicy и др.): сломанная защита от кирпича не должна уехать в релиз
+      # 5. Тесты: сломанная SafetyPolicy не должна уехать в релиз
       - name: Run tests
-        run: gradle test --no-daemon -PappVersion=${{ steps.ver.outputs.version_numeric }}
+        working-directory: ${{ steps.src.outputs.proj }}
+        run: gradle test --no-daemon -PappVersion=${{ steps.src.outputs.version_numeric }}
 
       # 6. Portable app-image (exe + урезанный runtime)
       - name: Build release distributable
-        run: gradle createReleaseDistributable --no-daemon -PappVersion=${{ steps.ver.outputs.version_numeric }}
+        working-directory: ${{ steps.src.outputs.proj }}
+        run: gradle createReleaseDistributable --no-daemon -PappVersion=${{ steps.src.outputs.version_numeric }}
 
-      # 7. Официальный adb.exe (бинарь Google не храним в репо)
+      # 7. Официальный adb.exe
       - name: Fetch Android platform-tools
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           Invoke-WebRequest -Uri "$env:PLATFORM_TOOLS_URL" -OutFile platform-tools.zip
           Expand-Archive -Path platform-tools.zip -DestinationPath .pt -Force
 
-      # 8. Сборка финальной portable-структуры + ZIP
+      # 8. Финальная portable-структура + ZIP
       - name: Assemble portable package
         id: pack
         shell: pwsh
         run: |
-          $ver  = "${{ steps.ver.outputs.version }}"
-          $name = "$env:APP_NAME"
-          $root = "dist/$name-v$ver"
-          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $proj = '${{ steps.src.outputs.proj }}'
+          $ver  = '${{ steps.src.outputs.version }}'
+          $name = $env:APP_NAME
+          $pkg  = "dist/$name-v$ver"
+          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
 
-          # 8.1 app-image: ChanganModRU.exe + app/ + runtime/
-          $img = "build/compose/binaries/main-release/app/$name"
-          if (-not (Test-Path $img)) { Write-Error "Не нашёл app-image: $img"; exit 1 }
-          Copy-Item "$img/*" -Destination $root -Recurse -Force
+          # 8.1 app-image: берём первую папку в main-release/app (имя не хардкодим)
+          $imgRoot = Join-Path $proj 'build/compose/binaries/main-release/app'
+          if (-not (Test-Path $imgRoot)) { Write-Error "Нет $imgRoot. Gradle-сборка не создала app-image." }
+          $img = Get-ChildItem $imgRoot -Directory | Select-Object -First 1
+          if ($null -eq $img) { Write-Error "В $imgRoot пусто" }
+          Copy-Item "$($img.FullName)/*" -Destination $pkg -Recurse -Force
+          $exe = Get-ChildItem $pkg -Filter '*.exe' -File | Where-Object Name -notmatch 'unins|adb' | Select-Object -First 1
+          if ($null -eq $exe) { Write-Error 'В app-image нет .exe' }
 
           # 8.2 adb.exe + dll рядом с exe
-          foreach ($f in 'adb.exe','AdbWinApi.dll','AdbWinUsbApi.dll') {
+          foreach ($f in 'adb.exe', 'AdbWinApi.dll', 'AdbWinUsbApi.dll') {
             $p = ".pt/platform-tools/$f"
-            if (-not (Test-Path $p)) { Write-Error "В platform-tools нет $f"; exit 1 }
-            Copy-Item $p -Destination $root -Force
+            if (-not (Test-Path $p)) { Write-Error "В platform-tools нет $f" }
+            Copy-Item $p -Destination $pkg -Force
           }
 
-          # 8.3 Папки полезной нагрузки
-          foreach ($d in ($env:PAYLOAD_DIRS -split ' ')) {
-            New-Item -ItemType Directory -Force -Path "$root/$d" | Out-Null
+          # 8.3 Apk / tinove / Scripts: берём то, что лежало в ZIP; если пусто, кладём подсказку
+          $hints = @{
+            'Apk'     = 'Положите сюда APK для установки в ГУ'
+            'tinove'  = 'Положите сюда голосовой ассистент (tinove)'
+            'Scripts' = 'Скрипты и рецепты (*.json)'
           }
-          if (Test-Path 'scripts-samples') {
-            Copy-Item 'scripts-samples/*' -Destination "$root/Scripts" -Recurse -Force
+          foreach ($d in 'Apk', 'tinove', 'Scripts') {
+            $dst = Join-Path $pkg $d
+            New-Item -ItemType Directory -Force -Path $dst | Out-Null
+            $from = Join-Path $proj $d
+            if (Test-Path $from) {
+              Get-ChildItem $from -Force | Where-Object Name -ne '.gitkeep' |
+                Copy-Item -Destination $dst -Recurse -Force
+            }
           }
-          "Положите сюда APK для установки в ГУ"       | Out-File -Encoding utf8 "$root/Apk/_READ_ME.txt"
-          "Положите сюда голосовой ассистент (tinove)" | Out-File -Encoding utf8 "$root/tinove/_READ_ME.txt"
+          $samples = Join-Path $proj 'scripts-samples'
+          if (Test-Path $samples) {
+            Copy-Item "$samples/*" -Destination (Join-Path $pkg 'Scripts') -Recurse -Force
+          }
+          $payload = [ordered]@{}
+          foreach ($d in 'Apk', 'tinove', 'Scripts') {
+            $dst = Join-Path $pkg $d
+            $cnt = @(Get-ChildItem $dst -Recurse -File -ErrorAction SilentlyContinue).Count
+            $payload[$d] = $cnt
+            if ($cnt -eq 0) { $hints[$d] | Out-File -Encoding utf8 (Join-Path $dst '_READ_ME.txt') }
+          }
 
-          # 8.4 VERSION.txt
-          "$name v$ver" | Out-File -Encoding utf8 "$root/VERSION.txt"
-
-          # 8.5 build-manifest.json: паспорт архива
-          $manifest = [ordered]@{
+          # 8.4 VERSION.txt + паспорт сборки
+          "$name v$ver" | Out-File -Encoding utf8 "$pkg/VERSION.txt"
+          [ordered]@{
             app          = $name
             version      = $ver
-            version_src  = "${{ steps.ver.outputs.source }}"
-            commit       = "${{ github.sha }}"
-            commit_short = "${{ steps.ver.outputs.sha_short }}"
+            version_src  = '${{ steps.src.outputs.version_src }}'
+            source_zip   = '${{ steps.src.outputs.source_zip }}'
+            exe          = $exe.Name
+            commit       = '${{ github.sha }}'
+            commit_short = '${{ steps.src.outputs.sha_short }}'
             built_at_utc = (Get-Date).ToUniversalTime().ToString('o')
-            run_id       = "${{ github.run_id }}"
+            run_id       = '${{ github.run_id }}'
             adb_bundled  = $true
-          }
-          $manifest | ConvertTo-Json -Depth 4 | Out-File -Encoding utf8 "$root/build-manifest.json"
+            payload_files = $payload
+          } | ConvertTo-Json -Depth 4 | Out-File -Encoding utf8 "$pkg/build-manifest.json"
 
-          # 8.6 ZIP: имя несёт версию
-          $zip = "$name-v$ver-portable-win64.zip"
-          Compress-Archive -Path "$root/*" -DestinationPath "dist/$zip" -Force
-          $hash = (Get-FileHash "dist/$zip" -Algorithm SHA256).Hash
-          "$hash  $zip" | Out-File -Encoding ascii "dist/$zip.sha256"
+          # 8.5 ZIP (CreateFromDirectory: корректно с большими файлами/zip64)
+          $zipName = "$name-v$ver-portable-win64.zip"
+          $zipPath = Join-Path (Get-Location) "dist/$zipName"
+          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+          [IO.Compression.ZipFile]::CreateFromDirectory((Resolve-Path $pkg).Path, $zipPath, 'Optimal', $false)
+          $hash = (Get-FileHash $zipPath -Algorithm SHA256).Hash
+          "$hash  $zipName" | Out-File -Encoding ascii "$zipPath.sha256"
 
-          "zip_name=$zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          $sizeMB = [math]::Round((Get-Item $zipPath).Length / 1MB, 1)
+          Write-Host "Готово: $zipName ($sizeMB MB), exe: $($exe.Name)"
+          "zip_name=$zipName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-      # 9. Артефакт сборки (есть и при ручном запуске)
+          @(
+            "### $name v$ver",
+            "- Источник: ``${{ steps.src.outputs.source_zip }}`` (версия из: ${{ steps.src.outputs.version_src }})",
+            "- Архив: ``$zipName`` ($sizeMB MB)",
+            "- Файлов в Apk/tinove/Scripts: $($payload['Apk'])/$($payload['tinove'])/$($payload['Scripts'])"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      # 9. Артефакт сборки (доступен всегда, даже без Release)
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
@@ -168,26 +317,29 @@ jobs:
           path: |
             dist/${{ steps.pack.outputs.zip_name }}
             dist/${{ steps.pack.outputs.zip_name }}.sha256
-          retention-days: 30
+          retention-days: 14
 
-      # 10. GitHub Release: только для тегов v*
+      # 10. GitHub Release vX.Y.Z (на каждый push; при ручном запуске по галочке)
       - name: Publish Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push' || inputs.publish
         uses: softprops/action-gh-release@v2
         with:
-          name: ${{ env.APP_NAME }} v${{ steps.ver.outputs.version }}
-          tag_name: ${{ github.ref_name }}
-          prerelease: ${{ contains(steps.ver.outputs.version, '-') }}
-          generate_release_notes: true
+          name: ${{ env.APP_NAME }} v${{ steps.src.outputs.version }}
+          tag_name: v${{ steps.src.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ steps.src.outputs.prerelease == 'True' }}
+          make_latest: ${{ steps.src.outputs.prerelease != 'True' }}
+          fail_on_unmatched_files: true
           files: |
             dist/${{ steps.pack.outputs.zip_name }}
             dist/${{ steps.pack.outputs.zip_name }}.sha256
           body: |
-            ### ChanganModRU v${{ steps.ver.outputs.version }} (portable, Windows x64)
+            ### ChanganModRU v${{ steps.src.outputs.version }} (portable, Windows x64)
 
-            Коммит: `${{ steps.ver.outputs.sha_short }}`
+            Собрано из: `${{ steps.src.outputs.source_zip }}`
+            Коммит: `${{ steps.src.outputs.sha_short }}`
 
-            В архиве: `ChanganModRU.exe` + урезанный JRE, `adb.exe`, папки `Apk/ tinove/ Scripts/`,
+            В архиве: exe + урезанный JRE, `adb.exe`, папки `Apk/ tinove/ Scripts/`,
             `build-manifest.json` (паспорт сборки) и `.sha256` для проверки целостности.
 
-            Распаковать в любую папку и запустить `ChanganModRU.exe`. Установка не требуется.
+            Распаковать в любую папку и запустить exe. Установка не нужна (Portable).
