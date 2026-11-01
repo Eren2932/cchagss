@@ -1,11 +1,11 @@
-name: Build & Release ChanganModRU
+name: Build & Release BRELLCAR 2.0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # КАК ПОЛЬЗОВАТЬСЯ (без распаковки):
 #   1. Положи этот файл в репо ОДИН РАЗ по пути  .github/workflows/build.yml
 #      (GitHub читает workflow только оттуда, из ZIP он не подхватится).
 #   2. Дальше просто заливаешь в репо новый ZIP проекта, например
-#         ChanganModRU-v2.1.1-src.zip
+#         BRELLCAR-v2.1.1-src.zip
 #      и делаешь commit/push. Сборка стартует сама.
 #
 # ЧТО ДЕЛАЕТ:
@@ -13,7 +13,7 @@ name: Build & Release ChanganModRU
 #   - Распаковывает его сам, находит build.gradle.kts (даже если внутри есть
 #     корневая папка), собирает Compose Desktop → portable-папка.
 #   - Докладывает adb.exe, папки Apk/ tinove/ Scripts/ (с тем, что лежало в ZIP).
-#   - Пакует ChanganModRU-vX.Y.Z-portable-win64.zip и публикует GitHub Release
+#   - Пакует BRELLCAR-vX.Y.Z-portable-win64.zip и публикует GitHub Release
 #     с тегом vX.Y.Z. Версия из имени ZIP попадает в exe, манифест, имя релиза.
 #   - Если ZIP нет вообще, а проект лежит в репо распакованным (build.gradle.kts
 #     в корне), собирает его.
@@ -48,7 +48,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  APP_NAME: ChanganModRU
+  APP_NAME: BRELLCAR
   PLATFORM_TOOLS_URL: 'https://dl.google.com/android/repository/platform-tools-latest-windows.zip'
 
 jobs:
@@ -143,7 +143,7 @@ jobs:
             } | Sort-Object { ($_.FullName -split '[\\/]').Count } | Select-Object -First 1
 
             if ($null -eq $g) {
-              Write-Error "В архиве '$($best.Rel)' нет build.gradle.kts. Это точно ZIP проекта (ChanganModRU-vX.Y.Z-src.zip)?"
+              Write-Error "В архиве '$($best.Rel)' нет build.gradle.kts. Это точно ZIP проекта (BRELLCAR-vX.Y.Z-src.zip)?"
             }
             $proj = [IO.Path]::GetRelativePath($root, $g.DirectoryName)
             $ver = $best.Ver.ToString()
@@ -164,7 +164,7 @@ jobs:
             $zipName = '(нет)'
           }
           else {
-            Write-Error "Не нашёл ни ZIP проекта (имя вида ChanganModRU-v2.1.1-src.zip), ни build.gradle.kts в корне репо."
+            Write-Error "Не нашёл ни ZIP проекта (имя вида BRELLCAR-v2.1.1-src.zip), ни build.gradle.kts в корне репо."
           }
 
           if (-not [string]::IsNullOrWhiteSpace($env:MANUAL_VER)) {
@@ -270,6 +270,18 @@ jobs:
           if (Test-Path $samples) {
             Copy-Item "$samples/*" -Destination (Join-Path $pkg 'Scripts') -Recurse -Force
           }
+          # 8.3b config.properties: URL сервера лицензий. Репозиторий публичный, поэтому ключи в нём не храним:
+          # кладём только шаблон .example, а рабочий config.properties пользователь создаёт рядом с exe сам.
+          $cfg = Join-Path $proj 'config.properties'
+          if (Test-Path $cfg) {
+            Copy-Item $cfg -Destination $pkg -Force
+          } else {
+            @(
+              '# Скопируйте этот файл в config.properties и укажите свой сервер лицензий.',
+              'license.baseUrl=https://your-fastapi-server.example',
+              '# license.apiKey='
+            ) | Out-File -Encoding utf8 (Join-Path $pkg 'config.properties.example')
+          }
           $payload = [ordered]@{}
           foreach ($d in 'Apk', 'tinove', 'Scripts') {
             $dst = Join-Path $pkg $d
@@ -338,7 +350,7 @@ jobs:
             dist/${{ steps.pack.outputs.zip_name }}
             dist/${{ steps.pack.outputs.zip_name }}.sha256
           body: |
-            ### ChanganModRU v${{ steps.src.outputs.version }} (portable, Windows x64)
+            ### BRELLCAR v${{ steps.src.outputs.version }} (portable, Windows x64)
 
             Собрано из: `${{ steps.src.outputs.source_zip }}`
             Коммит: `${{ steps.src.outputs.sha_short }}`
