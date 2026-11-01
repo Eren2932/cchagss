@@ -1,0 +1,193 @@
+name: Build & Release ChanganModRU
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Триггеры:
+#   1. Пуш тега вида v2.1.0  → релизная сборка + GitHub Release с ZIP.
+#   2. Ручной запуск (Actions → Run workflow) → сборка + артефакт (без Release).
+#
+# Логика версии (приоритет сверху вниз):
+#   git-тег  >  ручной ввод  >  дефолт из build.gradle.kts
+# Версия протягивается в Gradle (-PappVersion) и дальше в: exe, имя папки,
+# имя ZIP, VERSION.txt, build-manifest.json, имя Release. Поэтому каждый ZIP
+# однозначно знает, к какой версии и коммиту он относится.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Версия вручную (напр. 2.1.0). Пусто = дефолт из build.gradle.kts'
+        required: false
+        default: ''
+
+permissions:
+  contents: write   # создание Release и загрузка файлов
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP_NAME: ChanganModRU
+  PAYLOAD_DIRS: 'Apk tinove Scripts'
+  PLATFORM_TOOLS_URL: 'https://dl.google.com/android/repository/platform-tools-latest-windows.zip'
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      # 1. Код
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. JDK 17 (toolchain проекта)
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # 3. Gradle (в репо нет wrapper-jar, поэтому ставим версию явно)
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      # 4. Версия: тег > ручной ввод > дефолт из build.gradle.kts
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          $ref   = "${{ github.ref }}"
+          $input = "${{ github.event.inputs.version }}"
+          if ($ref -like 'refs/tags/v*') {
+            $v = $ref -replace '^refs/tags/v', ''
+            $src = 'git-tag'
+          } elseif (-not [string]::IsNullOrWhiteSpace($input)) {
+            $v = $input.Trim().TrimStart('v')
+            $src = 'manual-input'
+          } else {
+            $gradle = Get-Content 'build.gradle.kts' -Raw
+            $m = [regex]::Match($gradle, 'gradleProperty\("appVersion"\)\.getOrElse\("([^"]+)"\)')
+            if (-not $m.Success) { Write-Error 'Не нашёл дефолтную версию в build.gradle.kts'; exit 1 }
+            $v = $m.Groups[1].Value
+            $src = 'build.gradle.kts'
+          }
+          # Для exe нужна строго числовая версия X.Y.Z (суффикс -beta допустим только в имени)
+          $num = ($v -replace '[-+].*$', '')
+          if ($num -notmatch '^\d+\.\d+\.\d+$') {
+            Write-Error "Версия '$v' должна быть вида X.Y.Z или X.Y.Z-suffix"
+            exit 1
+          }
+          Write-Host "Версия: $v (числовая: $num, источник: $src)"
+          "version=$v"           | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "version_numeric=$num" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "source=$src"          | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "sha_short=$($env:GITHUB_SHA.Substring(0,7))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      # 5. Тесты (SafetyPolicy и др.): сломанная защита от кирпича не должна уехать в релиз
+      - name: Run tests
+        run: gradle test --no-daemon -PappVersion=${{ steps.ver.outputs.version_numeric }}
+
+      # 6. Portable app-image (exe + урезанный runtime)
+      - name: Build release distributable
+        run: gradle createReleaseDistributable --no-daemon -PappVersion=${{ steps.ver.outputs.version_numeric }}
+
+      # 7. Официальный adb.exe (бинарь Google не храним в репо)
+      - name: Fetch Android platform-tools
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "$env:PLATFORM_TOOLS_URL" -OutFile platform-tools.zip
+          Expand-Archive -Path platform-tools.zip -DestinationPath .pt -Force
+
+      # 8. Сборка финальной portable-структуры + ZIP
+      - name: Assemble portable package
+        id: pack
+        shell: pwsh
+        run: |
+          $ver  = "${{ steps.ver.outputs.version }}"
+          $name = "$env:APP_NAME"
+          $root = "dist/$name-v$ver"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+
+          # 8.1 app-image: ChanganModRU.exe + app/ + runtime/
+          $img = "build/compose/binaries/main-release/app/$name"
+          if (-not (Test-Path $img)) { Write-Error "Не нашёл app-image: $img"; exit 1 }
+          Copy-Item "$img/*" -Destination $root -Recurse -Force
+
+          # 8.2 adb.exe + dll рядом с exe
+          foreach ($f in 'adb.exe','AdbWinApi.dll','AdbWinUsbApi.dll') {
+            $p = ".pt/platform-tools/$f"
+            if (-not (Test-Path $p)) { Write-Error "В platform-tools нет $f"; exit 1 }
+            Copy-Item $p -Destination $root -Force
+          }
+
+          # 8.3 Папки полезной нагрузки
+          foreach ($d in ($env:PAYLOAD_DIRS -split ' ')) {
+            New-Item -ItemType Directory -Force -Path "$root/$d" | Out-Null
+          }
+          if (Test-Path 'scripts-samples') {
+            Copy-Item 'scripts-samples/*' -Destination "$root/Scripts" -Recurse -Force
+          }
+          "Положите сюда APK для установки в ГУ"       | Out-File -Encoding utf8 "$root/Apk/_READ_ME.txt"
+          "Положите сюда голосовой ассистент (tinove)" | Out-File -Encoding utf8 "$root/tinove/_READ_ME.txt"
+
+          # 8.4 VERSION.txt
+          "$name v$ver" | Out-File -Encoding utf8 "$root/VERSION.txt"
+
+          # 8.5 build-manifest.json: паспорт архива
+          $manifest = [ordered]@{
+            app          = $name
+            version      = $ver
+            version_src  = "${{ steps.ver.outputs.source }}"
+            commit       = "${{ github.sha }}"
+            commit_short = "${{ steps.ver.outputs.sha_short }}"
+            built_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+            run_id       = "${{ github.run_id }}"
+            adb_bundled  = $true
+          }
+          $manifest | ConvertTo-Json -Depth 4 | Out-File -Encoding utf8 "$root/build-manifest.json"
+
+          # 8.6 ZIP: имя несёт версию
+          $zip = "$name-v$ver-portable-win64.zip"
+          Compress-Archive -Path "$root/*" -DestinationPath "dist/$zip" -Force
+          $hash = (Get-FileHash "dist/$zip" -Algorithm SHA256).Hash
+          "$hash  $zip" | Out-File -Encoding ascii "dist/$zip.sha256"
+
+          "zip_name=$zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      # 9. Артефакт сборки (есть и при ручном запуске)
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack.outputs.zip_name }}
+          path: |
+            dist/${{ steps.pack.outputs.zip_name }}
+            dist/${{ steps.pack.outputs.zip_name }}.sha256
+          retention-days: 30
+
+      # 10. GitHub Release: только для тегов v*
+      - name: Publish Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ env.APP_NAME }} v${{ steps.ver.outputs.version }}
+          tag_name: ${{ github.ref_name }}
+          prerelease: ${{ contains(steps.ver.outputs.version, '-') }}
+          generate_release_notes: true
+          files: |
+            dist/${{ steps.pack.outputs.zip_name }}
+            dist/${{ steps.pack.outputs.zip_name }}.sha256
+          body: |
+            ### ChanganModRU v${{ steps.ver.outputs.version }} (portable, Windows x64)
+
+            Коммит: `${{ steps.ver.outputs.sha_short }}`
+
+            В архиве: `ChanganModRU.exe` + урезанный JRE, `adb.exe`, папки `Apk/ tinove/ Scripts/`,
+            `build-manifest.json` (паспорт сборки) и `.sha256` для проверки целостности.
+
+            Распаковать в любую папку и запустить `ChanganModRU.exe`. Установка не требуется.
